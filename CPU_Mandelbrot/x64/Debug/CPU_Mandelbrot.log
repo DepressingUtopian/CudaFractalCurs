@@ -1,0 +1,7 @@
+﻿  CPU_Mandelbrot.cpp
+c:\users\notebook\documents\cudafractalcurs\cpu_mandelbrot\cpu_mandelbrot.cpp(146): warning C4018: <: несоответствие типов со знаком и без знака
+c:\users\notebook\documents\cudafractalcurs\cpu_mandelbrot\cpu_mandelbrot.cpp(254): warning C4244: инициализация: преобразование "double" в "float", возможна потеря данных
+c:\users\notebook\documents\cudafractalcurs\cpu_mandelbrot\cpu_mandelbrot.cpp(255): warning C4244: инициализация: преобразование "double" в "float", возможна потеря данных
+c:\users\notebook\documents\cudafractalcurs\cpu_mandelbrot\cpu_mandelbrot.cpp(256): warning C4244: инициализация: преобразование "double" в "float", возможна потеря данных
+c:\users\notebook\documents\cudafractalcurs\cpu_mandelbrot\cpu_mandelbrot.cpp(294): warning C4244: =: преобразование "double" в "float", возможна потеря данных
+  CPU_Mandelbrot.vcxproj -> C:\Users\Notebook\Documents\CudaFractalCurs\x64\Debug\CPU_Mandelbrot.exe

@@ -1,5 +1,13 @@
 #include <iostream>
-
+#include <string>
+#include <iomanip>
+#include <fstream>
+#include <string>
+#include <sstream>
+#include <vector>
+#include <limits>
+#include <thread>
+#include <fstream>
 // GLEW
 #define GLEW_STATIC
 #include <GL/glew.h>
@@ -13,16 +21,23 @@
 #include <stdio.h>
 #include <thrust/complex.h>
 #include <cuComplex.h>
+
+#include <sys/stat.h>
+
+using namespace std;
 // Function prototypes
 void key_callback(GLFWwindow* window, int key, int scancode, int action, int mode);
-float *cpu_memory;
-// Window dimensions
-const GLuint WIDTH = 1000, HEIGHT = 1000;
-GLuint vertexShader;
-GLuint fragmentShader;
 
+const GLuint WIDTH = 1920, HEIGHT = 1080;
+
+GLdouble screen_ratio = (double)WIDTH / (double)HEIGHT;
+
+double cx = 0.0, cy = 0.0, zoom = 1.0;
+int fps = 0;
+bool isChange = false;
+GLFWwindow *window = nullptr;
 GLuint shaderProgram;
-// Shaders
+
 const GLchar* vertexShaderSource = "#version 330 core\n"
 "layout (location = 0) in vec3 position;\n"
 "layout (location = 1) in vec3 color;\n"
@@ -40,9 +55,10 @@ const GLchar* fragmentShaderSource = "#version 330 core\n"
 "color = vec4(ourColor, 1.0f);\n"
 "}\n\0";
 
-const GLuint MAX_ITERATION = 256;
-const GLdouble MAX_R = 0.1, MIN_R = 0.5, MAX_I = 0.1, MIN_I = -0.1;
-/* OpenGL interoperability */
+GLuint MAX_ITERATION = 1;
+
+float elapsed_time_gpu = 0;
+
 dim3 blocks, threads;
 
 //GLuint vbo; //int указатель на Vertex Buffer Object
@@ -52,7 +68,13 @@ GLuint VAO;
 
 struct cudaGraphicsResource *cuda_vbo_resource; //Структура предоставляющая реализацию VBO в CUDA
 
-//Отлов ошибок CUDA
+
+double last_time = 0, current_time = 0;
+unsigned int ticks = 0;
+
+bool keys[1024] = { 0 };
+
+
 static void HandleError(cudaError_t err, const char *file, int line) {
 	if (err != cudaSuccess) {
 		printf("%s in %s at line %d\n", cudaGetErrorString(err), file, line);
@@ -61,13 +83,96 @@ static void HandleError(cudaError_t err, const char *file, int line) {
 }
 #define HANDLE_ERROR( err ) (HandleError( err, __FILE__, __LINE__ ))
 
-void key_callback(GLFWwindow* window, int key, int scancode, int action, int mode)
+
+
+static void cursor_callback(GLFWwindow* window, double xpos, double ypos)
 {
-	// Когда пользователь нажимает ESC, мы устанавливаем свойство WindowShouldClose в true, 
-	// и приложение после этого закроется
-	if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS)
-		glfwSetWindowShouldClose(window, GL_TRUE);
 }
+
+void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
+{
+	double xpos, ypos;
+	glfwGetCursorPos(window, &xpos, &ypos);
+
+	double xr = 2.0 * (xpos / (double)WIDTH - 0.5);
+	double yr = 2.0 * (ypos / (double)HEIGHT - 0.5);
+
+	if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS) {
+		cx += (xr - cx) / zoom / 2.0;
+		cy -= (yr - cy) / zoom / 2.0;
+		isChange = true;
+	}
+	//isChange = true;
+}
+
+void scroll_callback(GLFWwindow* window, double xoffset, double yoffset)
+{
+	zoom += yoffset * 0.1 * zoom;
+	if (zoom < 0.1) {
+		zoom = 0.1;
+		
+	}
+	isChange = true;
+}
+
+static void key_callback(GLFWwindow* window, int key, int scancode, int action, int mods)
+{
+	const double d = 0.1 / zoom;
+
+	if (action == GLFW_PRESS) {
+		keys[key] = true;
+		isChange = true;
+	}
+	else if (action == GLFW_RELEASE) {
+		keys[key] = false;
+		isChange = true;
+	}
+
+	if (keys[GLFW_KEY_ESCAPE]) {
+		glfwSetWindowShouldClose(window, 1);
+
+	}
+	else if (keys[GLFW_KEY_A]) {
+		cx -= d;
+		isChange = true;
+	}
+	else if (keys[GLFW_KEY_D]) {
+		cx += d;
+		isChange = true;
+	}
+	else if (keys[GLFW_KEY_W]) {
+		cy += d;
+		isChange = true;
+	}
+	else if (keys[GLFW_KEY_S]) {
+		cy -= d;
+		isChange = true;
+	}
+	else if (keys[GLFW_KEY_MINUS] &&
+		MAX_ITERATION < std::numeric_limits <int>::max() - 10) {
+		MAX_ITERATION += 10;
+	}
+	else if (keys[GLFW_KEY_EQUAL]) {
+		MAX_ITERATION -= 10;
+		if (MAX_ITERATION <= 0) {
+			MAX_ITERATION = 0;
+		}
+	}
+	
+}
+static void update_window_title()
+{
+	std::ostringstream ss;
+	ss << "Mandelbrot Renderer";
+	ss << ", FPS: " << fps;
+	ss << ", Iterations: " << MAX_ITERATION;
+	ss << ", Zoom: " << zoom;
+	ss << ", At: (" << std::setprecision(8) << cx << " + " << cy << "i)";
+	glfwSetWindowTitle(window, ss.str().c_str());
+	//isChange = true;
+}
+
+
 __device__ double mapToReal(int x, int windowWidth, double minR, double maxR)
 {
 	double range = maxR - minR;
@@ -78,43 +183,20 @@ __device__ double mapToImaginary(int y, int windowHeigth, double minI, double ma
 	double range = maxI - minI;
 	return y * (range / windowHeigth) + minI;
 }
-__device__ int MandelbrotFunction(double p, double q, int maxIteration)
+__device__ double MandelbrotFunction(double p, double q, int maxIteration)
 {
 	int i = 0;
 	double x_t = 0.0, y_t = 0.0;
-	while (i < maxIteration && x_t*x_t + y_t * y_t <= 4.0)
+	while (i++ < maxIteration && x_t*x_t + y_t * y_t < 4.0)
 	{
 		double temp = x_t * x_t - y_t * y_t + p;
 		y_t = 2.0 * x_t * y_t + q;
 		x_t = temp;
-		i++;
-	}
 
-	return i;
-	/*
-	if (i < maxIteration)
-		return 255;
-	else
-		return 0;*/
-}
-__device__ int MandelbrotFunction2(double p, double q, int maxIteration)
-{
-	int i = 0;
-	double x_t = 0.0, y_t = 0.0;
-	thrust::complex<double> c = thrust::complex<double>(p,q);
-	thrust::complex<double> z(0,0);
-	thrust::complex<double> r = thrust::complex<double>(2, 2);
-
-	while ((abs(z.real()) < 2 && abs(z.imag()) < 2) && i <= maxIteration)
-	{
-		z = z * z + c;
-		i++;
 	}
-	if (i < maxIteration)
-		return 255;
-	else
-		return 0;
+	return (double)i / (double)maxIteration;
 }
+
 void createVBO(GLuint *vbo, struct cudaGraphicsResource **vbo_res, unsigned int vbo_res_flags)
 {
 	unsigned int size = WIDTH * HEIGHT * sizeof(float) * 6;
@@ -138,69 +220,45 @@ void deleteVBO(GLuint *vbo, struct cudaGraphicsResource *vbo_res)
 
 	*vbo = 0;
 }
-__device__ void setCoord(int x, int y, int offset, float *pixels)
+__device__ void setCoord(int x, int y, int offset,float *pixels)
 {
 	pixels[offset * 6] = (-1.0f + 2.0f * (float)(x / (float)WIDTH));			//x
 	pixels[offset * 6 + 1] = (-1.0f + 2.0f * (float)(y / (float)HEIGHT));		//y
 	pixels[offset * 6 + 2] = 0.0f;	//z
 
 }
-__device__ void setColor(int offset, int ColorValue, float *pixels)
+__device__ void setColor(int offset, double t,float *pixels,int maxIteration)
 {
-	float pixelColor = (float)(ColorValue % 256) / (float)256;
-	float r = 0, g = 0, b = 0;
-	if (pixelColor < 0.0001f)
-	{
-		r = 0; g = 0; b = 0;
-	}
-	else if (pixelColor < 0.45f)
-	{
-		r = (float)((int)(ColorValue * sinf(ColorValue)) % 256) / (float)256;
-		g = (float)(ColorValue % 256) / (float)256;
-		b = (float)((int)(ColorValue * cosf(ColorValue)) % 256) / (float)256;
-	}
-	else if (pixelColor < 0.60f)
-	{
-		r = (float)((int)(ColorValue * sinf(ColorValue)) % 256) / (float)256;
-		g = (float)(ColorValue % 256) / (float)256;
-		b = 1.0f;
-	}
-	else if (pixelColor < 0.80f)
-	{
-		r = (float)((int)(ColorValue * sinf(ColorValue) * sinf(ColorValue)) % 256) / (float)256;
-		g = (float)(ColorValue * ColorValue % 256) / (float)256;
-		b = (float)((int)(ColorValue * logf(ColorValue)) % 256) / (float)256;;
-	}
-	else
-	{
-		r = 1.0f;
-		g = 0.2f;
-		b = 0.66f;
-	}
+	//float t = (float)(ColorValue % maxIteration);
+	
 
-		pixels[offset * 6 + 3] = r;			//x
-		pixels[offset * 6 + 4] = g;		//y
-		pixels[offset * 6 + 5] = b;			//z
+	pixels[offset * 6 + 3] = 9.0 * (1.0 - t) * t * t * t;
+	pixels[offset * 6 + 4] = 15.0 * (1.0 - t) * (1.0 - t) * t * t;
+	pixels[offset * 6 + 5] = 8.5 * (1.0 - t) * (1.0 - t) * (1.0 - t) * t;
 	
 }
-__global__ void MandelbrotKernel(float* screen, int windowHeigth, int windowWidth, double maxR, double maxI, 
-	double minR, double minI, int maxIteration)
+__global__ void MandelbrotKernel(float* screen, int windowHeigth, int windowWidth, int maxIteration,double zoom, double cx, double cy, double screen_ratio)
 {
-	int x = blockIdx.x;
-	int y = blockIdx.y;
+	int x = threadIdx.x + blockIdx.x * blockDim.x;
+	int y = threadIdx.y + blockIdx.y * blockDim.y;
+	
 
 	if (x >= WIDTH || y >= HEIGHT)
 		return;
 
-	int offset = x + y * gridDim.x;
+	int offset = x + y * WIDTH;
 	//double p = mapToReal(x, windowWidth, minR, maxR);
 	//double q = mapToImaginary(y, windowHeigth, minI, maxI);
-	double p = (float)x / WIDTH - 1.5;
-	double q = (float)y / HEIGHT - 0.5;;
-	int MandelbrotValue = MandelbrotFunction(p, q, maxIteration);
-
-	setCoord(x, y, offset, screen);
-	setColor(offset, MandelbrotValue, screen);
+	double p = (double)screen_ratio * (double)((double)x / (double)WIDTH - 0.5);
+	double q = ((double)y / (double)HEIGHT - 0.5);
+	p /= zoom;
+	q /= zoom;
+	p += cx;
+	q += cy;
+	double MandelbrotValue = MandelbrotFunction(p, q, maxIteration);
+	__syncthreads();
+	setCoord(x, y, offset, screen);	
+	setColor(offset, MandelbrotValue, screen,maxIteration);
 
 }
 
@@ -246,12 +304,13 @@ void initCuda(int deviceId) {
 		blocks.x, blocks.y, threads.x, threads.y, blocks.x * threads.x,
 		blocks.y * threads.y);
 }
+
 void MaldelbrotGPU_Calculation()
 {
 	float *dev_screen;
+	//float * gpu_PixelsMemory = (float*)malloc(WIDTH * HEIGHT * sizeof(float) * 6);
+	dim3 *blocks2 = new dim3(WIDTH,HEIGHT);
 	
-	dim3 *blocks2 = new dim3(WIDTH,HEIGHT,1);
-	cpu_memory = (float*)malloc(WIDTH * HEIGHT * sizeof(float) * 6);
 	size_t size;
 
 	HANDLE_ERROR(cudaGraphicsMapResources(1, &cuda_vbo_resource, 0));
@@ -264,126 +323,49 @@ void MaldelbrotGPU_Calculation()
 	HANDLE_ERROR(cudaEventRecord(startEvent, 0));
 
 	// Render Image
-	MandelbrotKernel << <*blocks2, 1 >> > (dev_screen, HEIGHT, WIDTH, MAX_R, MAX_I, MIN_R, MIN_I, MAX_ITERATION);
+	MandelbrotKernel << <blocks, threads >> > (dev_screen, HEIGHT, WIDTH, MAX_ITERATION,zoom,cx,cy,screen_ratio);
 	HANDLE_ERROR(cudaDeviceSynchronize());
-
-	HANDLE_ERROR(cudaGraphicsUnmapResources(1, &cuda_vbo_resource, 0));
-
-	// Kernel Time measure
-	HANDLE_ERROR(cudaEventRecord(stopEvent, 0));
-	HANDLE_ERROR(cudaEventSynchronize(stopEvent));
-	HANDLE_ERROR(cudaEventElapsedTime(&elapsedTime, startEvent, stopEvent));
-
-	std::cout << std::endl;
-	printf("Время выполнения: %f ms\n", elapsedTime);
-	cudaThreadSynchronize();
-	cudaMemcpy(cpu_memory, dev_screen, WIDTH * HEIGHT * sizeof(float) * 6, cudaMemcpyDeviceToHost);
-	int count = 0;
 	/*
+	cudaMemcpy(gpu_PixelsMemory, dev_screen, WIDTH * HEIGHT * sizeof(float) * 6, cudaMemcpyDeviceToHost);
+	int count = 0;
 	for (int i = 0; i < WIDTH * HEIGHT * 6; i++)
 	{
-		//if (i >= WIDTH * HEIGHT * 6 - WIDTH)
-		//{
-			
-			
+		if (i >= WIDTH * HEIGHT * 6 - WIDTH)
+		{
+
+
 			if (count == 6)
 			{
 				std::cout << std::endl;
 				count = 0;
 			}
-			std::cout << " " << i << " " << cpu_memory[i] << " ";
+			std::cout << " " << i << " " << gpu_PixelsMemory[i] << " ";
 			count++;
-		//}
+		}
 	}*/
-}
-void CreateVertexShader()
-{
-	GLint success;
-	GLchar infoLog[512];
-	vertexShader = glCreateShader(GL_VERTEX_SHADER);
-	glShaderSource(vertexShader, 1, &vertexShaderSource, NULL);
-	glCompileShader(vertexShader);
+	
+	// Kernel Time measure
+	HANDLE_ERROR(cudaEventRecord(stopEvent, 0));
+	HANDLE_ERROR(cudaEventSynchronize(stopEvent));
+	HANDLE_ERROR(cudaEventElapsedTime(&elapsedTime, startEvent, stopEvent));
+	HANDLE_ERROR(cudaGraphicsUnmapResources(1, &cuda_vbo_resource, 0));
 
-	glGetShaderiv(vertexShader, GL_COMPILE_STATUS, &success);
-	if (!success)
-	{
-		glGetShaderInfoLog(vertexShader, 512, NULL, infoLog);
-		std::cout << "ERROR::SHADER::VERTEX::COMPILATION_FAILED\n" << infoLog << std::endl;
-	}
+//	std::cout << std::endl;
+	printf("Время выполнения: %f s\n", elapsedTime / 1000.0);
+	elapsed_time_gpu = elapsedTime / 1000.0;
+	
 }
-void CreateFragmentShader()
-{
-	GLint success;
-	GLchar infoLog[512];
-	fragmentShader = glCreateShader(GL_FRAGMENT_SHADER);
-	glShaderSource(fragmentShader, 1, &fragmentShaderSource, NULL);
-	glCompileShader(fragmentShader);
 
-	glGetShaderiv(vertexShader, GL_COMPILE_STATUS, &success);
-	if (!success)
-	{
-		glGetShaderInfoLog(vertexShader, 512, NULL, infoLog);
-		std::cout << "ERROR::SHADER::FRAGMENT::COMPILATION_FAILED\n" << infoLog << std::endl;
-	}
-}
-void InitShaders()
+void InitShaders(GLuint &prog)
 {
 	GLint success;
 	GLchar infoLog[512];
 
-	CreateVertexShader();
-	CreateFragmentShader();
-
-	shaderProgram = glCreateProgram();
-	glAttachShader(shaderProgram, vertexShader);
-	glAttachShader(shaderProgram, fragmentShader);
-	glLinkProgram(shaderProgram);
-
-	glGetProgramiv(shaderProgram, GL_LINK_STATUS, &success);
-	if (!success) {
-		glGetProgramInfoLog(shaderProgram, 512, NULL, infoLog);
-		std::cout << "ERROR::SHADER::FRAGMENT::COMPILATION_FAILED\n" << infoLog << std::endl;
-	}
-	glDeleteShader(vertexShader);
-	glDeleteShader(fragmentShader);
-}
-// The MAIN function, from here we start the application and run the game loop
-int main()
-{
-
-	setlocale(LC_ALL, "Russian");
-	// Init GLFW
-	glfwInit();
-	// Set all the required options for GLFW
-	glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
-	glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
-	glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-	glfwWindowHint(GLFW_RESIZABLE, GL_FALSE);
-
-	// Create a GLFWwindow object that we can use for GLFW's functions
-	GLFWwindow* window = glfwCreateWindow(WIDTH, HEIGHT, "LearnOpenGL", nullptr, nullptr);
-	glfwMakeContextCurrent(window);
-
-	// Set the required callback functions
-	glfwSetKeyCallback(window, key_callback);
-
-	// Set this to true so GLEW knows to use a modern approach to retrieving function pointers and extensions
-	glewExperimental = GL_TRUE;
-	// Initialize GLEW to setup the OpenGL Function pointers
-	glewInit();
-
-	// Define the viewport dimensions
-	glViewport(0, 0, WIDTH, HEIGHT);
-
-
-	// Build and compile our shader program
-	// Vertex shader
 	GLuint vertexShader = glCreateShader(GL_VERTEX_SHADER);
 	glShaderSource(vertexShader, 1, &vertexShaderSource, NULL);
 	glCompileShader(vertexShader);
 	// Check for compile time errors
-	GLint success;
-	GLchar infoLog[512];
+
 	glGetShaderiv(vertexShader, GL_COMPILE_STATUS, &success);
 	if (!success)
 	{
@@ -402,18 +384,68 @@ int main()
 		std::cout << "ERROR::SHADER::FRAGMENT::COMPILATION_FAILED\n" << infoLog << std::endl;
 	}
 	// Link shaders
-	GLuint shaderProgram = glCreateProgram();
-	glAttachShader(shaderProgram, vertexShader);
-	glAttachShader(shaderProgram, fragmentShader);
-	glLinkProgram(shaderProgram);
+	prog = glCreateProgram();
+	glAttachShader(prog, vertexShader);
+	glAttachShader(prog, fragmentShader);
+	glLinkProgram(prog);
 	// Check for linking errors
-	glGetProgramiv(shaderProgram, GL_LINK_STATUS, &success);
+	glGetProgramiv(prog, GL_LINK_STATUS, &success);
 	if (!success) {
-		glGetProgramInfoLog(shaderProgram, 512, NULL, infoLog);
+		glGetProgramInfoLog(prog, 512, NULL, infoLog);
 		std::cout << "ERROR::SHADER::PROGRAM::LINKING_FAILED\n" << infoLog << std::endl;
 	}
 	glDeleteShader(vertexShader);
 	glDeleteShader(fragmentShader);
+}
+
+// The MAIN function, from here we start the application and run the game loop
+
+int main()
+{
+
+	setlocale(LC_ALL, "Russian");
+	ofstream time;
+	ofstream iters;
+	time.open("./time.txt", ios::out | ios::trunc);
+	iters.open("./iters.txt", ios::out | ios::trunc);
+	//std::thread thread(MaldelbrotGPU_Calculation);
+
+	// Init GLFW
+	glfwInit();
+	// Set all the required options for GLFW
+	glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
+	glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 1);
+	glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+	glfwWindowHint(GLFW_RESIZABLE, GL_FALSE);
+
+	atexit(glfwTerminate);
+
+
+	// Create a GLFWwindow object that we can use for GLFW's functions
+	window = glfwCreateWindow(WIDTH, HEIGHT, "MandelbrotCuda", nullptr, nullptr);
+
+	// Set the required callback functions
+	
+	glfwSetKeyCallback(window, key_callback);
+	glfwSetCursorPosCallback(window, cursor_callback);
+	glfwSetMouseButtonCallback(window, mouse_button_callback);
+	glfwSetScrollCallback(window, scroll_callback);
+	glfwSetInputMode(window, GLFW_CURSOR_NORMAL, GLFW_STICKY_KEYS);
+	
+	glfwMakeContextCurrent(window);
+
+	// Set this to true so GLEW knows to use a modern approach to retrieving function pointers and extensions
+	glewExperimental = GL_TRUE;
+	// Initialize GLEW to setup the OpenGL Function pointers
+	glewInit();
+
+	// Define the viewport dimensions
+	glViewport(0, 0, WIDTH, HEIGHT);
+
+
+	// Build and compile our shader program
+	// Vertex shader
+	
 
 
 	// Set up vertex data (and buffer(s)) and attribute pointers
@@ -428,17 +460,17 @@ int main()
 	GLuint VBO, VAO;
 	createVBO(&VBO, &cuda_vbo_resource, cudaGraphicsMapFlagsWriteDiscard);
 	MaldelbrotGPU_Calculation();
+
+
+	InitShaders(shaderProgram);
+
 	glGenVertexArrays(1, &VAO);
-	//glGenBuffers(1, &VBO);
-	// Bind the Vertex Array Object first, then bind and set vertex buffer(s) and attribute pointer(s).
+	
+
 	glBindVertexArray(VAO);
 
 	glBindBuffer(GL_ARRAY_BUFFER, VBO);
-	
 
-	
-
-	//glBufferData(GL_ARRAY_BUFFER, sizeof(cpu_memory), cpu_memory, GL_STATIC_DRAW);
 
 	// Position attribute
 	glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(GLfloat), (GLvoid*)0);
@@ -448,19 +480,22 @@ int main()
 	glEnableVertexAttribArray(1);
 
 	glBindVertexArray(0); // Unbind VAO
-
-	GLubyte data[256];
-	glGetBufferSubData(GL_ARRAY_BUFFER, 1024, 256, data);
+	last_time = glfwGetTime();
 	// Game loop
 	while (!glfwWindowShouldClose(window))
 	{
+		
+	    MaldelbrotGPU_Calculation();
+			
+		
 		// Check if any events have been activiated (key pressed, mouse moved etc.) and call corresponding response functions
 		glfwPollEvents();
-
+		//MaldelbrotCPU_Calculation();
 		// Render
 		// Clear the colorbuffer
+		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 		glClearColor(0.2f, 0.3f, 0.3f, 1.0f);
-		glClear(GL_COLOR_BUFFER_BIT);
+		
 
 		// Draw the triangle
 		glUseProgram(shaderProgram);
@@ -470,6 +505,22 @@ int main()
 
 		// Swap the screen buffers
 		glfwSwapBuffers(window);
+
+		ticks++;
+		current_time = glfwGetTime();
+		if (current_time - last_time > 1.0) {
+			fps = ticks;
+			update_window_title();
+			last_time = glfwGetTime();
+			ticks = 0;
+		}
+		if (MAX_ITERATION < 200)
+		{
+
+			iters << MAX_ITERATION << endl;
+			time << elapsed_time_gpu << endl;
+			MAX_ITERATION++;
+		}
 	}
 	// Properly de-allocate all resources once they've outlived their purpose
 	glDeleteVertexArrays(1, &VAO);
